@@ -1,0 +1,370 @@
+#define PORT 0x3F8
+#define CMOS_ADDR 0x70
+#define CMOS_DATA 0x71
+
+volatile unsigned short* terminal_buffer = (volatile unsigned short*)0xB8000;
+static int cursor_x = 0;
+static int cursor_y = 0;
+static char cmd_buffer[64];
+static int cmd_idx = 0;
+
+unsigned char kbd_us[128] = {
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '[', ']', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ';', '\'', '`', 0,
+    '\\', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', ',', '.', '/', 0, '*', 0, ' '
+};
+
+/* --- 1. ARCHITECTURE BRIDGE (DAPAT UNA NI PARA KAI_LA ANG RTC) --- */
+static inline void outb(unsigned short port, unsigned char val) {
+    asm volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline void outw(unsigned short port, unsigned short val) {
+    asm volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline unsigned char inb(unsigned short port) {
+    unsigned char ret;
+    asm volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+/* --- 2. VGA CORE FUNCTIONS --- */
+void vga_put_char(int x, int y, char c, unsigned char color) {
+    if (x >= 80 || y >= 25) return;
+    terminal_buffer[y * 80 + x] = (unsigned short)c | (unsigned short)color << 8;
+}
+
+// Helper para sa Clock ug Menu placement
+void vga_print_at_pos(const char* str, unsigned char color, int row, int col) {
+    int old_x = cursor_x; int old_y = cursor_y;
+    cursor_x = col; cursor_y = row;
+    vga_print(str, color);
+    cursor_x = old_x; cursor_y = old_y;
+}
+
+void vga_print_int_at(int n, int row, int col) {
+    int old_x = cursor_x; int old_y = cursor_y;
+    cursor_x = col; cursor_y = row;
+    vga_print_int(n);
+    cursor_x = old_x; cursor_y = old_y;
+}
+
+/* --- 3. REAL-TIME CLOCK (RTC) LOGIC --- */
+unsigned char get_update_in_progress_flag() {
+    outb(CMOS_ADDR, 0x0A);
+    return (inb(CMOS_DATA) & 0x80);
+}
+
+unsigned char get_rtc_register(int reg) {
+    outb(CMOS_ADDR, reg);
+    return inb(CMOS_DATA);
+}
+
+void display_time() {
+    while (get_update_in_progress_flag());
+    unsigned char hour = get_rtc_register(0x04);
+    unsigned char min  = get_rtc_register(0x02);
+    unsigned char sec  = get_rtc_register(0x00);
+
+    // BCD to Binary Conversion
+    hour = (hour & 0x0F) + ((hour / 16) * 10);
+    min  = (min & 0x0F) + ((min / 16) * 10);
+    sec  = (sec & 0x0F) + ((sec / 16) * 10);
+
+    // I-display sa Row 0, sugod sa Column 60
+    vga_print_at_pos("TIME: ", 0x1E, 0, 60);
+    vga_print_int_at(hour, 0, 66); vga_print_at_pos(":", 0x1E, 0, 68);
+    vga_print_int_at(min, 0, 69);  vga_print_at_pos(":", 0x1E, 0, 71);
+    vga_print_int_at(sec, 0, 72);
+}
+
+/* --- 4. UI & BRANDING --- */
+void draw_status_bar() {
+    for(int i = 0; i < 80; i++) {
+        vga_put_char(i, 0, ' ', 0x1F); // Blue Bar
+    }
+    vga_print_at_pos(" SevenOS v3.2 | MASTER ALOY | [HE] Help ", 0x1F, 0, 1);
+    display_time();
+}
+
+void display_banner() {
+    vga_print("  ____  _______      _______ _   _ \n", 0x0B);
+    vga_print(" / ___|| ____\\ \\   / / ____| \\ | |\n", 0x0B);
+    vga_print(" \\___ \\|  _|   \\ \\ / /|  _| |  \\| |\n", 0x0B);
+    vga_print("  ___) | |___   \\ V / | |___| |\\  |\n", 0x0B);
+    vga_print(" |____/|_____|   \\_/  |_____|_| \\_|\n", 0x0B);
+    vga_print("\n        OS v3.2 - ARCHITECT ELITE\n", 0x0F);
+}
+
+// ... DIRI NA MO-SUGOD ANG IMONG MGA MATH UG SECURITY TOOLS ...
+
+void vga_print_hex_byte(unsigned char n) {
+    char *chars = "0123456789ABCDEF";
+    vga_put_char(cursor_x++, cursor_y, chars[(n >> 4) & 0x0F], 0x0E);
+    vga_put_char(cursor_x++, cursor_y, chars[n & 0x0F], 0x0E);
+}
+
+void vga_print_int(int n) {
+    if (n == 0) { vga_put_char(cursor_x++, cursor_y, '0', 0x0F); return; }
+    if (n < 0) { vga_put_char(cursor_x++, cursor_y, '-', 0x0F); n = -n; }
+    char buf[12];
+    int i = 0;
+    while (n > 0) { buf[i++] = (n % 10) + '0'; n /= 10; }
+    while (--i >= 0) {
+        vga_put_char(cursor_x++, cursor_y, buf[i], 0x0F);
+        if (cursor_x >= 80) { cursor_x = 0; cursor_y++; check_scroll(); }
+    }
+}
+
+// Optimized string_to_int para dili ma-stuck
+int string_to_int(char* s, int* pos) {
+    int res = 0;
+    // Elite Skip: Laktawan ang tanan nga DILI numero (lakip ang spaces)
+    while (s[*pos] != '\0' && (s[*pos] < '0' || s[*pos] > '9')) {
+        (*pos)++;
+    }
+    // Convert: Sugod na og kuha sa digits
+    while (s[*pos] >= '0' && s[*pos] <= '9') {
+        res = res * 10 + (s[*pos] - '0');
+        (*pos)++;
+    }
+    return res;
+}
+
+void vga_print_binary(unsigned char n) {
+    for (int i = 7; i >= 0; i--) {
+        if (n & (1 << i)) {
+            vga_put_char(cursor_x++, cursor_y, '1', 0x0E); // Yellow 1
+        } else {
+            vga_put_char(cursor_x++, cursor_y, '0', 0x07); // Gray 0
+        }
+        if (cursor_x >= 80) { cursor_x = 0; cursor_y++; check_scroll(); }
+    }
+}
+
+void crack_password(char* target) {
+    char guess[6]; // 5 chars + null
+    guess[5] = '\0';
+    int attempts = 0;
+
+    static const char* charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    int set_len = 36;
+
+    vga_print("STRESS TEST (5-Chars): ", 0x0E); vga_print(target, 0x0E); vga_print("\n", 0x07);
+
+    for (int i = 0; i < set_len; i++) {
+        for (int j = 0; j < set_len; j++) {
+            for (int k = 0; k < set_len; k++) {
+                for (int l = 0; l < set_len; l++) {
+                    for (int m = 0; m < set_len; m++) {
+                        guess[0] = charset[i];
+                        guess[1] = charset[j];
+                        guess[2] = charset[k];
+                        guess[3] = charset[l];
+                        guess[4] = charset[m];
+                        attempts++;
+
+                        // I-compare ang 5 letters
+                        if (guess[0] == target[0] && guess[1] == target[1] &&
+                            guess[2] == target[2] && guess[3] == target[3] &&
+                            guess[4] == target[4]) {
+
+                            vga_print("\nSUCCESS! Pass: ", 0x0A); vga_print(guess, 0x0A);
+                            vga_print("\nAttempts: ", 0x07); vga_print_int(attempts);
+                            vga_print("\n", 0x07);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    vga_print("Failed. Not found.\n", 0x0C);
+}
+
+void encrypt_text(char* input) {
+    vga_print("Original: ", 0x07); vga_print(input, 0x07); vga_print("\n", 0x07);
+
+    vga_print("Encrypted: ", 0x0A); // Green color for "Secure"
+
+    for (int i = 0; input[i] != '\0'; i++) {
+        char c = input[i];
+
+        // I-scramble lang nato ang letters A-Z ug numbers 0-9
+        if (c >= 'A' && c <= 'Z') {
+            c = ((c - 'A' + 3) % 26) + 'A';
+        } else if (c >= '0' && c <= '9') {
+            c = ((c - '0' + 3) % 10) + '0';
+        }
+
+        char out[2] = {c, '\0'};
+        vga_print(out, 0x0A);
+    }
+    vga_print("\n", 0x07);
+}
+
+void decrypt_text(char* input) {
+    vga_print("Ciphertext: ", 0x07);
+    vga_print(input, 0x07);
+    vga_print("\n", 0x07);
+
+    vga_print("Decrypted: ", 0x0B); // Light Blue para "Unlocked"
+
+    for (int i = 0; input[i] != '\0'; i++) {
+        char c = input[i];
+
+        if (c >= 'A' && c <= 'Z') {
+            // +23 is the same as -3 in a 26-letter circle
+            c = ((c - 'A' + 23) % 26) + 'A';
+        } else if (c >= '0' && c <= '9') {
+            // +7 is the same as -3 in a 10-number circle
+            c = ((c - '0' + 7) % 10) + '0';
+        }
+
+        char out[2] = {c, '\0'};
+        vga_print(out, 0x0B);
+    }
+    vga_print("\n", 0x07);
+}
+
+void process_command() {
+    cursor_x = 0; cursor_y++; check_scroll();
+    if (cmd_idx == 0) goto prompt;
+
+    // 1. HELP (HE) - Unahon nato ni para dali ra makita ang listahan
+    if (cmd_buffer[0] == 'H' && cmd_buffer[1] == 'E') {
+        vga_print("CMDS: AD, SU, MU, DI, CL, EX, ME, BI, PC, EN, DE\n", 0x0F);
+    }
+    // 2. CLEAR (CL)
+    else if (cmd_buffer[0] == 'C' && cmd_buffer[1] == 'L') {
+        clear_screen(); display_banner();
+    }
+    // 3. EXIT (EX)
+    else if (cmd_buffer[0] == 'E' && cmd_buffer[1] == 'X') {
+        vga_print("Shutting down SevenOS...\n", 0x04);
+        outw(0x604, 0x2000); // QEMU Shutdown
+    }
+    // 4. MEMDUMP (ME)
+    else if (cmd_buffer[0] == 'M' && cmd_buffer[1] == 'E') {
+        vga_print("RAM @ 0x100: ", 0x07);
+        unsigned char* ptr = (unsigned char*)0x100000;
+        for (int i = 0; i < 8; i++) { vga_print_hex_byte(ptr[i]); vga_print(" ", 0x07); }
+        vga_print("\n", 0x07);
+    }
+
+// . BINARY CONVERTER (BI)
+    else if (cmd_buffer[0] == 'B' && cmd_buffer[1] == 'I') {
+        int p = 2;
+        int n = string_to_int(cmd_buffer, &p);
+        vga_print("\nBINARY: ", 0x0F);
+        vga_print_binary((unsigned char)n);
+        vga_print("\n", 0x07);
+    }
+
+// . PASSWORD CRACKER (PC)
+    else if (cmd_buffer[0] == 'P' && cmd_buffer[1] == 'C') {
+        char target[6];
+        target[0] = cmd_buffer[3];
+        target[1] = cmd_buffer[4];
+        target[2] = cmd_buffer[5];
+        target[3] = cmd_buffer[6];
+        target[4] = cmd_buffer[7];
+        target[5] = '\0';
+
+        crack_password(target);
+    }
+
+else if (cmd_buffer[0] == 'E' && cmd_buffer[1] == 'N') {                      // I-encrypt ang text pagkahuman sa "EN " space
+        encrypt_text(&cmd_buffer[3]);
+    }
+
+// . DECRYPTION (DE)
+    else if (cmd_buffer[0] == 'D' && cmd_buffer[1] == 'E') {
+        decrypt_text(&cmd_buffer[3]);
+    }
+
+    // 5. MATH OPERATIONS (AD, SU, MU, DI)
+    else {
+        int p = 2; // Sugod sa index 2
+        int n1 = string_to_int(cmd_buffer, &p);
+        int n2 = string_to_int(cmd_buffer, &p);
+
+        // I-print ang newline sa sugod para dili tapad sa command
+        vga_print("\n", 0x07);
+
+        if (cmd_buffer[0] == 'A' && cmd_buffer[1] == 'D') {
+            vga_print("RESULT: ", 0x0A); // Green label
+            vga_print_int(n1 + n2);
+        }
+        else if (cmd_buffer[0] == 'S' && cmd_buffer[1] == 'U') {
+            vga_print("RESULT: ", 0x0C); // Red label
+            vga_print_int(n1 - n2);
+        }
+        else if (cmd_buffer[0] == 'M' && cmd_buffer[1] == 'U') {
+            vga_print("RESULT: ", 0x0E); // Yellow label
+            vga_print_int(n1 * n2);
+        }
+        else if (cmd_buffer[0] == 'D' && cmd_buffer[1] == 'I') {
+            if (n2 == 0) {
+                vga_print("ERR: DIV/0", 0x04);
+            } else {
+                vga_print("RESULT: ", 0x0B); // Cyan label
+                vga_print_int(n1 / n2);
+            }
+        }
+        else {
+            vga_print("WN: UNKNOWN CMD", 0x04);
+        }
+
+        // Human sa Result, butangan og extra newline para sa prompt
+        vga_print("\n", 0x07);
+    }
+
+prompt:
+    vga_print("ALOY: $ ", 0x0B);
+    // Siguroha nga limpyo ang buffer para sa sunod nga type
+    for(int i = 0; i < 64; i++) cmd_buffer[i] = 0;
+    cmd_idx = 0;
+}
+
+void keyboard_handler() {
+    if (!(inb(0x64) & 1)) return;
+    unsigned char scancode = inb(0x60);
+    if (!(scancode & 0x80)) {
+        char key = kbd_us[scancode];
+        if (key == '\n') { cmd_buffer[cmd_idx] = '\0'; process_command(); }
+        else if (key == '\b' && cmd_idx > 0) {
+            cmd_idx--; if(cursor_x > 0) cursor_x--;
+            vga_put_char(cursor_x, cursor_y, ' ', 0x07);
+        } else if (key != 0 && cmd_idx < 63) {
+            cmd_buffer[cmd_idx++] = key;
+            vga_put_char(cursor_x++, cursor_y, key, 0x0F);
+            check_scroll();
+        }
+    }
+}
+
+void kernel_main() {
+    clear_screen();
+    cursor_y = 1; // Sugod sa ika-duha nga linya                          draw_status_bar();
+    display_banner();
+    vga_print("ALOY: $ ", 0x0B);
+
+    int time_counter = 0;
+    while(1) {
+        keyboard_handler();
+
+        // I-update ang oras matag kadiyot (dili pirme para dili mo-flicker)                                                                        time_counter++;
+        if (time_counter > 10000) {
+            display_time();                                                       time_counter = 0;
+        }
+
+        #if defined(__i386__) || defined(__x86_64__)
+            asm volatile ("pause");
+        #else
+            asm volatile ("nop");
+        #endif
+    }
+}
