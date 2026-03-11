@@ -7,7 +7,6 @@ SECTIONS {
     . = 0x1000;
 
     .text : ALIGN(4) {
-        /* I-force ang _start sa pinaka-unahan sa binary */
         *(.text.start)
         *(.text)
     }
@@ -25,7 +24,11 @@ SECTIONS {
         *(COMMON)
     }
 
-    /* I-discard ang Alpine/Linux specific sections nga makaguba sa flat binary */
+    /* KANI ANG IMPORTANTE: I-marka ang tumoy sa kernel */
+    _kernel_end = .; 
+    end = .;
+
+    /* I-discard ang Alpine/Linux specific sections */
     /DISCARD/ : {
         *(.comment)
         *(.eh_frame)

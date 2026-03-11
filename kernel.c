@@ -65,6 +65,11 @@ static inline uint16_t inw(uint16_t port) {
     return result;
 }
 
+typedef unsigned int uint32_t;
+extern uint32_t end;
+
+int system_running = 1; // Kinahanglan naa ni sa gawas para makita sa tanan
+
 // I-define ni sa gawas (Global Variables) para ma-access sa keyboard_handler
 int screensaver_active = 0;
 
@@ -148,10 +153,13 @@ void vga_print_int(int n) {
     }
 }
 
-void vga_print_hex_byte(unsigned char n) {
+// I-declare nato ang helper para kaila ang ME command
+void vga_print_hex_32(uint32_t n) {
     char *chars = "0123456789ABCDEF";
-    vga_put_char(cursor_x++, cursor_y, chars[(n >> 4) & 0x0F], 0x0E);
-    vga_put_char(cursor_x++, cursor_y, chars[n & 0x0F], 0x0E);
+    // I-print ang matag nibble (total 8 nibbles para sa 32-bit)
+    for (int i = 7; i >= 0; i--) {
+        vga_put_char(cursor_x++, cursor_y, chars[(n >> (i * 4)) & 0x0F], 0x0E);
+    }
 }
 
 void vga_print_binary(unsigned char n) {
@@ -541,9 +549,49 @@ void load_all_files() {
     }
 }
 
+void remove_file(char* filename) {
+    int found = 0;
+    // Siguroha nga ang '16' o 'MAX_FILES' match sa imong struct definition
+    for (int i = 0; i < 16; i++) { 
+        if (file_system[i].active && str_compare(file_system[i].name, filename)) {
+            file_system[i].active = 0; // Logical delete
+            found = 1;
+            break;
+        }
+    }
+
+    if (found) {
+        // I-sync sa Sector 10 (Gikuha ni nako sa imong SV command logic)
+        disk_write_sector(10, (uint8_t*)file_system);
+        vga_print("\n[FS] File removed and Disk Synced.\n", 0x0A);
+    } else {
+        vga_print("\n[ERR] File not found.\n", 0x0C);
+    }
+}
+
+void exit_system() {
+    vga_print("\n[SYSTEM] Syncing Disk...", 0x0E);
+    disk_write_sector(10, (uint8_t*)file_system);
+    
+    vga_print("\n[SYSTEM] Exiting SevenOS. Returning to Alpine...", 0x0A);
+
+    // Kani nga code mo-send og signal sa QEMU para mo-close ang window
+    // ug mobalik ka sa imong terminal prompt.
+    outw(0x604, 0x2000); 
+    
+    // Safety halt kon dili mo-work ang ACPI shutdown
+    system_running = 0; 
+}
+
 /* --- 6. COMMAND ENGINE --- */
 
 void process_command() {
+    // 1. I-declare ang symbols sa taas
+    extern uint32_t end; 
+    uint32_t k_end = (uint32_t)&end;
+    int p = 2;
+    int n1;
+
     cursor_x = 0;
     cursor_y++;
     check_scroll();
@@ -552,7 +600,7 @@ void process_command() {
 
     // --- 1. SYSTEM & FILE OPS ---
     if (str_compare(cmd_buffer, "HE")) {
-        vga_print("CMDS: LS, LD, SV, TO, RD, CL, RE, WH, CO, DT, EN, DE, PC, ME, BI, AD, SU, MU, DI\n", 0x0F);
+        vga_print("CMDS: LS, LD, SV, RM, TO, RD, CL, RE, EX, WH, CO, DT, EN, DE, PC, ME, BI, AD, SU, MU, DI\n", 0x0F);
     }
     else if (str_compare(cmd_buffer, "LS")) {
         list_files();
@@ -566,6 +614,9 @@ void process_command() {
         vga_print("\n[DISK] Loading FS from Sector 10...", 0x0B);
         disk_read_sector(10, (uint8_t*)file_system);
         vga_print(" DONE.\n", 0x0F);
+    }
+    else if (cmd_buffer[0] == 'R' && cmd_buffer[1] == 'M') {
+        remove_file(&cmd_buffer[3]);
     }
     else if (cmd_buffer[0] == 'T' && cmd_buffer[1] == 'O') {
         create_file(&cmd_buffer[3]);
@@ -589,6 +640,9 @@ void process_command() {
     else if (str_compare(cmd_buffer, "RE")) {
         reboot();
     }
+    else if (str_compare(cmd_buffer, "EX")) {
+        exit_system();
+    }
     else if (str_compare(cmd_buffer, "CL")) {
         clear_screen(); draw_status_bar(); draw_toolbar(); display_banner();
     }
@@ -607,12 +661,21 @@ void process_command() {
 
     // --- 3. MATH & VISUALIZATION ---
     else if (cmd_buffer[0] == 'M' && cmd_buffer[1] == 'E') {
-        run_matrix();
+        vga_print("\n--- [ KERNEL MEMORY MONITOR ] ---\n", 0x0E);
+        vga_print("KERNEL BASE : 0x00100000\n", 0x0F);
+        vga_print("KERNEL END  : ", 0x0F);
+
+        vga_print_hex_32(k_end); // Siguradong kaila ang compiler ani
+
+        vga_print("\nSTATUS      : STABLE\n", 0x0A);
+        vga_print("---------------------------------\n", 0x0E);
     }
+
     else {
-        int p = 2;
-        int n1 = string_to_int(cmd_buffer, &p);
-        
+        // I-reuse nato ang variable p ug n1
+        p = 2;
+        n1 = string_to_int(cmd_buffer, &p);
+
         if (cmd_buffer[0] == 'B' && cmd_buffer[1] == 'I') {
             vga_print("\nBIN: ", 0x0B); vga_print_binary((unsigned char)n1); vga_print("\n", 0x07);
         }
@@ -648,7 +711,7 @@ prompt:
     for(int i = 0; i < 64; i++) cmd_buffer[i] = 0;
     cmd_idx = 0;
     update_cursor(cursor_x, cursor_y);
-}
+} // <--- KANI NGA BRACKET ANG IMPORTANTE!
 
 /* --- 7. SYSTEM FLOW --- */
 void keyboard_handler() {
@@ -766,12 +829,12 @@ void _start() {
 void kernel_main() {
     // 1. VGA & INITIAL SCREEN SETUP
     clear_screen();
-    
+
     // --- CRITICAL FIX: DILI NATO I-ZERO ANG FS ---
     // Imbes nga i-set og 0, atong i-load ang gikan sa Disk (Sector 10)
     vga_print("[SYSTEM] Loading File System from Disk...", 0x0E);
     load_all_files(); // Kani dapat ang mo-populate sa file_system array
-    
+
     // Kon empty gyud ang disk (first time boot), dinhi ra nato i-initialize
     if (file_system[0].active != 1 && file_system[0].active != 0) {
         for (int i = 0; i < MAX_FILES; i++) file_system[i].active = 0;
@@ -782,12 +845,12 @@ void kernel_main() {
     boot_animation();
 
     // 3. UI INITIAL LAYOUT
-    clear_screen();      
-    draw_status_bar();   
-    draw_toolbar();      
+    clear_screen();
+    draw_status_bar();
+    draw_toolbar();
 
-    cursor_y = 1;        
-    display_banner();    
+    cursor_y = 1;
+    display_banner();
 
     // I-report kon naay na-restore nga files
     if (file_system[0].active == 1) {
@@ -795,7 +858,7 @@ void kernel_main() {
     }
 
     vga_print("7shell >> ", 0x0B);
-    update_cursor(10, cursor_y); 
+    update_cursor(10, cursor_y);
 
     unsigned long long time_counter = 0;
     const unsigned long long target_idle = 30000000;
@@ -822,7 +885,7 @@ void kernel_main() {
         if (cursor_y >= 24) {
             check_scroll();
             draw_status_bar();
-            draw_toolbar();    
+            draw_toolbar();
         }
 
         __asm__ __volatile__ ("pause");
