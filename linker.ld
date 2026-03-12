@@ -1,9 +1,9 @@
-/* SevenOS v3.3 Linker Script - Alpine Edition */
+/* SevenOS v3.3 Linker Script - Optimized */
 OUTPUT_FORMAT("binary")
 ENTRY(_start)
 
 SECTIONS {
-    /* Sugod sa 4KB address */
+    /* Sugod sa 4KB address - Match sa boot.asm */
     . = 0x1000;
 
     .text : ALIGN(4) {
@@ -19,16 +19,18 @@ SECTIONS {
         *(.data*)
     }
 
+    /* BSS section (Zero-initialized data) */
     .bss : ALIGN(4) {
+        _bss_start = .;
         *(.bss*)
         *(COMMON)
+        _bss_end = .;
     }
 
-    /* KANI ANG IMPORTANTE: I-marka ang tumoy sa kernel */
-    _kernel_end = .; 
+    /* Mao ni ang gigamit sa imong 'ME' command para i-print ang KERNEL END */
+    _kernel_end = .;
     end = .;
 
-    /* I-discard ang Alpine/Linux specific sections */
     /DISCARD/ : {
         *(.comment)
         *(.eh_frame)

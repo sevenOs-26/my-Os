@@ -8,12 +8,38 @@ typedef unsigned long long uint64_t;
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
 
-volatile unsigned short* terminal_buffer = (volatile unsigned short*)0xB8000;
+static unsigned short* terminal_buffer = (unsigned short*)0xB8000;
 static int cursor_x = 0;
 static int cursor_y = 0;
 static char cmd_buffer[64];
 static int cmd_idx = 0;
 
+/* --- 1. LOW-LEVEL HARDWARE I/O --- */
+static inline void outb(unsigned short port, unsigned char val) {
+    asm volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline unsigned char inb(unsigned short port) {
+    unsigned char ret;
+    asm volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+static inline void outw(unsigned short port, unsigned short val) {
+    asm volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline unsigned short inw(unsigned short port) {
+    unsigned short ret;
+    asm volatile ("inw %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+/* --- 2. CMOS ACCESS --- */
+unsigned char read_cmos(unsigned char reg) {
+    outb(0x70, reg);
+    return inb(0x71);
+}
 unsigned char current_theme_color = 0x0F; // Default: White
 
 unsigned char kbd_us[128] = {
@@ -41,34 +67,26 @@ int inactivity_timer = 0; // Para sa Matrix
 
 /* --- 1. ARCHITECTURE BRIDGE (Diri nimo i-add ang inw) --- */
 
-// I-send ang 8-bit data
-static inline void outb(unsigned short port, unsigned char val) {
-    asm volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-// I-send ang 16-bit data (Gamit sa Disk Write)
-static inline void outw(unsigned short port, unsigned short val) {
-    asm volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
-}
-
-// I-receive ang 8-bit data
-static inline unsigned char inb(unsigned short port) {
-    unsigned char ret;
-    asm volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
-
-// I-receive ang 16-bit data (Gamit sa Disk Read - KANI ANG MISSING)
-static inline uint16_t inw(uint16_t port) {
-    uint16_t result;
-    asm volatile ("inw %1, %0" : "=a"(result) : "Nd"(port));
-    return result;
-}
+static char history_buffer[64]; // Tipiganan sa last command
+static int history_exists = 0;  // Flag kon naa na ba'y sulod
 
 typedef unsigned int uint32_t;
 extern uint32_t end;
 
 int system_running = 1; // Kinahanglan naa ni sa gawas para makita sa tanan
+
+int strlen(char* s) {
+    int i = 0;
+    while (s[i] != '\0') i++;
+    return i;
+}
+
+unsigned char hex_to_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
+}
 
 // I-define ni sa gawas (Global Variables) para ma-access sa keyboard_handler
 int screensaver_active = 0;
@@ -217,49 +235,63 @@ void display_date() {
     vga_print("\n", 0x07);
 }
 
-void display_time() {
-    outb(CMOS_ADDR, 0x0A);
-    if (inb(CMOS_DATA) & 0x80) return;
+void display_time_at(int x, int y) {
+    unsigned char hour = read_cmos(0x04);
+    unsigned char min  = read_cmos(0x02);
+    unsigned char sec  = read_cmos(0x00);
 
-    unsigned char hour = get_rtc_register(0x04);
-    unsigned char min  = get_rtc_register(0x02);
-    unsigned char sec  = get_rtc_register(0x00);
-
+    // BCD to Decimal conversion
     hour = (hour & 0x0F) + ((hour / 16) * 10);
     min  = (min & 0x0F) + ((min / 16) * 10);
     sec  = (sec & 0x0F) + ((sec / 16) * 10);
 
-    vga_print_at_pos("TIME: ", 0x1E, 0, 60);
-    vga_print_int_at(hour, 0, 66); vga_print_at_pos(":", 0x1E, 0, 68);
-    vga_print_int_at(min, 0, 69);  vga_print_at_pos(":", 0x1E, 0, 71);
-    vga_print_int_at(sec, 0, 72);
+    // I-print sa status bar (Blue background 0x1F)
+    vga_put_char(x,     y, (hour / 10) + '0', 0x1F);
+    vga_put_char(x + 1, y, (hour % 10) + '0', 0x1F);
+    vga_put_char(x + 2, y, ':', 0x1F);
+    vga_put_char(x + 3, y, (min / 10) + '0', 0x1F);
+    vga_put_char(x + 4, y, (min % 10) + '0', 0x1F);
+    vga_put_char(x + 5, y, ':', 0x1F);
+    vga_put_char(x + 6, y, (sec / 10) + '0', 0x1F);
+    vga_put_char(x + 7, y, (sec % 10) + '0', 0x1F);
+}
+
+// Para support sa karaan nga logic
+void display_time() {
+    display_time_at(71, 0);
 }
 
 /* --- 5. UI BRANDING & SECURITY --- */
 void draw_status_bar() {
-    for(int i = 0; i < 80; i++) vga_put_char(i, 0, ' ', 0x1F);
+    for(int i = 0; i < 80; i++) {
+        vga_put_char(i, 0, ' ', 0x1F); // Solid Blue line
+    }
     vga_print_at_pos(" SevenOS v3.2 | MASTER ALOY | [HE] Help ", 0x1F, 0, 1);
-    display_time();
+    display_time(); // Tawgon ang display_time_at(71,0)
 }
 
 void display_banner() {
-    // Ang Main Logo (Seven) - High Tech Cyan (0x0B)
-    vga_print("  ____  _______      _______ _   _ \n", 0x0B);
-    vga_print(" / ___|| ____\\ \\   / / ____| \\ | |\n", 0x0B);
-    vga_print(" \\___ \\|  _|   \\ \\ / /|  _| |  \\| |\n", 0x0B);
-    vga_print("  ___) | |___   \\ V / | |___| |\\  |\n", 0x0B);
-    vga_print(" |____/|_____|   \\_/  |_____|_| \\_|\n", 0x0B);
+    // I-reset ang cursor pero sugod sa LINE 1 (dili 0!)
+    // Para ang Line 0 mabilin para sa Status Bar
+    cursor_x = 0;
+    cursor_y = 1; 
 
-    // Branding ug Version - Pure White (0x0F)
-    vga_print("\n        SEVEN OS v3.2 - ARCHITECT ELITE\n", 0x0F);
-    
-    // Ang Full Brand Mantra
-    // "Build the Future." (Cyan 0x0B) ug "Start before you're ready." (Gray 0x07)
-    vga_print("    Build the Future. ", 0x0B);
-    vga_print("\"Start before you're ready.\"\n", 0x07);
-    
-    // Separator para limpyo tan-awon - Dark Gray (0x08)
-    vga_print(" ------------------------------------------\n", 0x08);
+    // 1. Logo
+    vga_print("____  _______     _______ _   _ \n", 0x0B);
+    vga_print("/ ___|| ____\\ \\   / / ____| \\ | |\n", 0x0B);
+    vga_print("\\___ \\|  _|   \\ \\ / /|  _| |  \\| |\n", 0x0B);
+    vga_print(" ___) | |___   \\ V / | |___| |\\  |\n", 0x0B);
+    vga_print("|____/|_____|   \\_/  |_____|_| \\_|\n", 0x0B);
+
+    // 2. Branding
+    vga_print("\n      SEVEN OS v3.2 - ELITE\n", 0x0F);
+
+    // 3. Mantra
+    vga_print(" Build the Future.\n", 0x0B);
+    vga_print(" \"Start before you're ready.\"\n", 0x07);
+
+    // 4. Separator
+    vga_print(" --------------------------------\n", 0x08);
 }
 
 void encrypt_text(char* input) {
@@ -284,27 +316,56 @@ void decrypt_text(char* input) {
     vga_print("\n", 0x07);
 }
 
-void crack_password(char* target) {
-    char guess[6]; guess[5] = '\0';
-    int attempts = 0;
-    static const char* charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    vga_print("STRESS TEST (5-Chars): ", 0x0E); vga_print(target, 0x0E); vga_print("\n", 0x07);
-    for (int i=0; i<36; i++) {
-        for (int j=0; j<36; j++) {
-            for (int k=0; k<36; k++) {
-                for (int l=0; l<36; l++) {
-                    for (int m=0; m<36; m++) {
-                        guess[0]=charset[i]; guess[1]=charset[j]; guess[2]=charset[k]; guess[3]=charset[l]; guess[4]=charset[m];
-                        attempts++;
-                        if (guess[0]==target[0] && guess[1]==target[1] && guess[2]==target[2] && guess[3]==target[3] && guess[4]==target[4]) {
-                            vga_print("\nSUCCESS! Pass: ", 0x0A); vga_print(guess, 0x0A);
-                            vga_print("\nAttempts: ", 0x07); vga_print_int(attempts); vga_print("\n", 0x07);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
+// 1. Helper Function para sa Hex Conversion
+unsigned char hex_to_byte(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
+}
+
+// I-butang ni sa line 145 or luyo sa vga_print definition
+void print(const char* str) {
+    vga_print(str, 0x07); // 0x07 is Light Gray (standard)
+}
+
+void print_err(const char* str) {
+    vga_print(str, 0x0C); // 0x0C is Red
+}
+
+void print_ok(const char* str) {
+    vga_print(str, 0x0A); // 0x0A is Green
+}
+
+void cmd_pc(char* hex_input) {
+    static char decoded[64];
+    int i = 0;
+    int j = 0;
+
+    for(int k = 0; k < 64; k++) decoded[k] = 0;
+
+    // KANI: Gidugangan og color argument (0x0F = White)
+    vga_print("[PC] Force Cracking...\n", 0x0F);
+
+    while (hex_input[i] != '\0' && hex_input[i+1] != '\0') {
+        if (j >= 63) break; 
+
+        unsigned char high = hex_to_byte(hex_input[i]);
+        unsigned char low = hex_to_byte(hex_input[i+1]);
+        
+        decoded[j++] = (high << 4) | low;
+        i += 2;
+    }
+    
+    decoded[j] = '\0';
+
+    if (j == 0) {
+        // Gidugangan og 0x0C (Red) para sa Failed message
+        vga_print("[FAILED] Error in Kernel Buffer.\n", 0x0C);
+    } else {
+        vga_print("[SUCCESS] Decoded: ", 0x0A); // 0x0A = Light Green
+        vga_print(decoded, 0x0F);
+        vga_print("\n", 0x0F);
     }
 }
 
@@ -655,8 +716,11 @@ void process_command() {
     else if (cmd_buffer[0] == 'D' && cmd_buffer[1] == 'E') {
         decrypt_text(&cmd_buffer[3]);
     }
+    // I-insert ni sa imong if-else chain
     else if (cmd_buffer[0] == 'P' && cmd_buffer[1] == 'C') {
-        crack_password(&cmd_buffer[3]);
+        // Mo-check kon naay space o wala (e.g., "PC 1D" o "PC1D")
+        char* hex_payload = (cmd_buffer[2] == ' ') ? &cmd_buffer[3] : &cmd_buffer[2]; 
+        cmd_pc(hex_payload);
     }
 
     // --- 3. MATH & VISUALIZATION ---
@@ -715,43 +779,93 @@ prompt:
 
 /* --- 7. SYSTEM FLOW --- */
 void keyboard_handler() {
-    if (!(inb(0x64) & 1)) return; 
+    // 1. Check kon naa ba'y data sa keyboard controller (Status Register)
+    if (!(inb(0x64) & 1)) return;
 
+    // 2. Kuhaon ang Scancode
     unsigned char scancode = inb(0x60);
+    inactivity_timer = 0; // Reset timer sa matag lihok
 
+    // 3. I-process lang kon "Key Press" (scancode < 0x80)
     if (!(scancode & 0x80)) {
         char key = kbd_us[scancode];
-        inactivity_timer = 0; 
 
-        // 1. ENTER KEY
-        if (key == '\n') {
-            cmd_buffer[cmd_idx] = '\0'; 
-            process_command();          
-        }
-
-        // 2. BACKSPACE
-        else if (key == '\b') {
-            if (cmd_idx > 0) {
-                cmd_idx--;
-                // Sigurohon nga dili mapapas ang "7shell >> "
-                if (cursor_x > 10) { 
+        /* --- NAVIGATION: UP ARROW (HISTORY RECALL) --- */
+        if (scancode == 0x48) {
+            if (history_exists) {
+                // Limpyohan ang kasamtangan nga input sa screen
+                while (cursor_x > 10) {
                     cursor_x--;
                     vga_put_char(cursor_x, cursor_y, ' ', 0x07);
-                    update_cursor(cursor_x, cursor_y); // I-sync ang blinking line
+                }
+                // I-overload ang cmd_buffer gikan sa history
+                cmd_idx = 0;
+                for (int i = 0; history_buffer[i] != '\0' && i < 63; i++) {
+                    cmd_buffer[cmd_idx++] = history_buffer[i];
+                    vga_put_char(cursor_x, cursor_y, history_buffer[i], 0x0F);
+                    cursor_x++;
                 }
             }
         }
 
-        // 3. REGULAR KEYS
-        else if (key != 0 && cmd_idx < 63) {
-            // --- SAFETY CHECK PARA SA "RUNNING RIGHT" BUG ---
-            if (cursor_x < 79) { // Ayaw palapasa sa 80 characters
-                cmd_buffer[cmd_idx++] = key;
-                vga_put_char(cursor_x, cursor_y, key, 0x0F);
-                cursor_x++; // I-advance ang cursor position
-                update_cursor(cursor_x, cursor_y); // Importante para dili mag-ghosting
+        /* --- NAVIGATION: DOWN ARROW (CLEAR LINE) --- */
+        else if (scancode == 0x50) {
+            while (cursor_x > 10) {
+                cursor_x--;
+                vga_put_char(cursor_x, cursor_y, ' ', 0x07);
+            }
+            cmd_idx = 0;
+            for(int i=0; i<64; i++) cmd_buffer[i] = 0;
+        }
+
+        /* --- NAVIGATION: LEFT ARROW --- */
+        else if (scancode == 0x4B) {
+            if (cursor_x > 10) cursor_x--;
+        }
+
+        /* --- NAVIGATION: RIGHT ARROW --- */
+        else if (scancode == 0x4D) {
+            // Dili palapason sa kung asa ra ang gi-type
+            if (cursor_x < (10 + cmd_idx)) cursor_x++;
+        }
+
+        /* --- SYSTEM: ENTER KEY --- */
+        else if (key == '\n') {
+            cmd_buffer[cmd_idx] = '\0';
+            
+            // Save to History kon naay gi-type
+            if (cmd_idx > 0) {
+                for(int i = 0; i < 64; i++) {
+                    history_buffer[i] = cmd_buffer[i];
+                    if (cmd_buffer[i] == '\0') break;
+                }
+                history_exists = 1;
+            }
+            
+            process_command(); // Tawgon ang command parser (PC, ME, etc.)
+            // Note: Ang cursor_x/y i-reset sa process_command human sa output
+        }
+
+        /* --- SYSTEM: BACKSPACE --- */
+        else if (key == '\b') {
+            if (cmd_idx > 0 && cursor_x > 10) {
+                cmd_idx--;
+                cursor_x--;
+                vga_put_char(cursor_x, cursor_y, ' ', 0x07);
             }
         }
+
+        /* --- CHARACTER INPUT: REGULAR KEYS --- */
+        else if (key != 0 && cmd_idx < 63) {
+            if (cursor_x < 79) {
+                cmd_buffer[cmd_idx++] = key;
+                vga_put_char(cursor_x, cursor_y, key, 0x0F);
+                cursor_x++;
+            }
+        }
+
+        // KINAHANGLAN: I-sync ang hardware blinking cursor sa atong cursor_x/y
+        update_cursor(cursor_x, cursor_y);
     }
 }
 

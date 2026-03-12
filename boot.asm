@@ -6,31 +6,35 @@ _start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0x7c00
+    mov sp, 0x7c00          ; Stack sa Real Mode
     mov [BOOT_DRIVE], dl
 
-    ; --- DEBUG SIGNAL 1: 'B' (Bootloader started) ---
+    ; --- DEBUG SIGNAL 1: 'B' ---
     mov al, 'B'
     mov ah, 0x0e
     int 0x10
 
-    ; LOAD KERNEL
+    ; --- LOAD KERNEL ---
+    ; Sigurohon nato ang ES:BX address (0x0000:0x1000)
+    xor ax, ax
+    mov es, ax              ; ES = 0
+    mov bx, 0x1000          ; BX = 0x1000. Kernel loads at 0x1000
+
     mov ah, 0x02
-    mov al, 32          ; Load 32 sectors
+    mov al, 32              ; Balik sa 32 sectors (16KB) para mas safe sa BIOS
     mov ch, 0x00
     mov dh, 0x00
-    mov cl, 0x02        ; Sugod sa Sector 2
+    mov cl, 0x02            ; Sector 2
     mov dl, [BOOT_DRIVE]
-    mov bx, 0x1000      ; I-load sa address 0x1000
     int 0x13
-    jc disk_error
+    jc disk_error           ; Mo-print og 'E' kon naay problema sa disk
 
-    ; --- DEBUG SIGNAL 2: 'K' (Kernel Loaded in RAM) ---
+    ; --- DEBUG SIGNAL 2: 'K' ---
     mov al, 'K'
     mov ah, 0x0e
     int 0x10
 
-    ; ENABLE A20 LINE (Importante sa Alpine/QEMU)
+    ; ENABLE A20 LINE
     in al, 0x92
     or al, 2
     out 0x92, al
@@ -51,13 +55,16 @@ init_32bit:
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    mov esp, 0x90000
+
+    ; --- THE STACK RE-BORE ---
+    ; Gi-ubos nato gamay sa 0x7FFFF para sigurado nga layo sa BIOS/VGA reserved areas
+    mov esp, 0x7FFFF
+    mov ebp, esp
 
     ; --- FINAL JUMP SA KERNEL ---
     jmp 0x1000
 
 disk_error:
-    ; Print 'E' kon naay problema sa disk
     mov al, 'E'
     mov ah, 0x0e
     int 0x10
